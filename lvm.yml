@@ -1,0 +1,129 @@
+---
+- name: Работа с LVM
+  hosts: all
+  become: true
+  tasks:
+    - name: Проверка существования PV на /dev/vdf
+      shell: "pvs | grep -q '/dev/vdf'"
+      register: pv_check_vdf
+      changed_when: false
+      failed_when: false
+    
+    - name: Создание PV на /dev/vdf
+      command: pvcreate /dev/vdf
+      when: pv_check_vdf.rc != 0
+
+    - name: Проверка существования PV на /dev/vdg
+      shell: "pvs | grep -q '/dev/vdg'"
+      register: pv_check_vdg
+      changed_when: false
+      failed_when: false
+
+    - name: Создание PV на /dev/vdg
+      command: pvcreate /dev/vdg
+      when: pv_check_vdg.rc != 0
+
+    - name: Создание VG с именем vg_root на /dev/vdf и /dev/vdg
+      lvg:
+        vg: vg_root
+        pvs:
+          - /dev/vdf
+          - /dev/vdg
+
+    - name: Создание LV с lv_root на 100% оставшегося пространства
+      lvol:
+        vg: vg_root
+        lv: lv_root
+        size: +100%FREE
+
+    - name: Создание ext4 файловой системы для /
+      filesystem:
+        fstype: ext4
+        dev: /dev/vg_root/lv_root
+
+    - name: Уменьшение тома под / до 8Gb
+      lvol:
+        vg: vg_root
+        lv: lv_root
+        size: 8G
+        resizefs: yes
+        force: true # Иначе вот такое: FAILED! => {"changed": false, "msg": "Sorry, no shrinking of lv_root without force=true."}
+    
+    # Закомментирую, так как иначе после выполнени плейбука пропадает доступ по ssh, к серверу "UNREACHABLE! => {"changed": false, "msg": "Failed to connect to the host via ssh: leonidas@130.193.58.57: Permission denied (publickey).", "unreachable": true}
+    #- name: Создание тома для /home
+    #  lvol:
+    #    vg: vg_root
+    #    lv: lv_home
+    #    size: 10G
+
+    #- name: Создание ext4 файловой системы для /home
+    #  filesystem:
+    #    fstype: ext4
+    #    dev: /dev/vg_root/lv_home
+
+    #- name: Монтирование /home
+    #  ansible.builtin.mount:
+    #    path: /home
+    #    src: /dev/vg_root/lv_home
+    #   fstype: ext4
+    #    opts: defaults
+    #    state: mounted
+    
+    - name: Проверка существования LV lv_var
+      lvol:
+        vg: vg_root
+        lv: lv_var
+      register: lv_check_var
+      changed_when: false
+      failed_when: false
+
+    - name: Создание зеркального тома для /var
+      command: lvcreate --size 2G --name lv_var --type raid1 --mirrors 1 /dev/vg_root
+      when: lv_check_var.lv is not defined
+
+    - name: Создание ext4 файловой системы для /var
+      filesystem:
+        fstype: ext4
+        dev: /dev/vg_root/lv_var
+
+    - name: Монтирование /var
+      ansible.builtin.mount:
+        path: /var
+        src: /dev/vg_root/lv_var
+        fstype: ext4
+        opts: defaults
+        state: mounted
+
+    - name: Создание снапшота для /home
+      command: lvcreate --size 1G --snapshot --name home_snapshot /dev/vg_root/lv_home
+
+    - name: Создание ext4 файловой системы для /home_snapshot
+      filesystem:
+        fstype: ext4
+        dev: /dev/vg_root/home_snapshot
+
+    - name: Добавить /home в fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "/dev/vg_root/lv_home /home ext4 defaults 0 2"
+
+    - name: Добавить /var в fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "/dev/vg_root/lv_var /var ext4 defaults 0 2"
+
+    - name: Добавить снапшот /home в fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "/dev/vg_root/home_snapshot /home_snapshot ext4 defaults 0 2"
+
+    - name: Генерация файлов в /home
+      shell: "echo 'Test file' > /home/test_file.txt"
+
+    - name: Удаление некоторых файлов из /home
+      file:
+        path: /home/test_file.txt
+        state: absent
+
+    - name: Восстановление из снапшота
+      command: lvconvert --merge /dev/vg_root/home_snapshot
